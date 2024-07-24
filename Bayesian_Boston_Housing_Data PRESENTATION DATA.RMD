@@ -41,12 +41,12 @@ bayesian_ridge_horseshoe <- function(X, y, n_iter = 10000, burn_in = 1000) {
   p <- ncol(X)
   
   #hyperparameters
-  nu<- 5
+  nu<- 10
   lambda_0<-1e-1
-  gamma<- rep(5,p)
+  gamma<- rep(10,p)
   
   # Priors
-  alpha <- 10
+  alpha <- 20
   
   
   # Initialize
