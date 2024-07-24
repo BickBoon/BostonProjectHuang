@@ -1,0 +1,427 @@
+---
+title: "Variable Selection and Bayesian Analysis with Boston Dataset"
+author: "Matthew Cuza, Nicholas Doon, Myles Lindsey"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+library(BoomSpikeSlab)
+library(MASS)
+library(loo)
+library(glmnet)
+library(caret)
+library(ggplot2)
+library(BayesianTools)
+library(AICcmodavg)
+
+#load horseshoe package in order to add the horseshoe prior to the ridge regression, it uses a distributionthat penalizes small coefficients more and gives extra power to higher coefficients. Mathematically, it uses a distribution with thicker tails that helps with data that is highly-dimensional with few variables holding significant probability of inclusion 
+library(horseshoe)
+
+```
+
+# Load and Prepare Data, treat y values as vector and let R know that the 14th column is the response variable
+
+```{r}
+data(Boston)
+Boston <- na.omit(Boston)
+X <- scale(Boston[,1:13])
+y <- as.vector(scale(Boston[,14]))
+set.seed(3)
+data <- data.frame(y = y, X)
+```
+
+# Bayesian Ridge Regression evaluates samples of random data representing random variables that represent each predictor variable. summary shows the results of the ridge regression that are significant predictors of the response variable
+
+```{r}
+set.seed(3)
+bayesian_ridge <- function(X, y, n_iter = 10000, burn_in = 1000) {
+  n <- nrow(X)
+  p <- ncol(X)
+  
+  # Priors
+  alpha <- 1e-6
+  lambda <- 1e-6
+  
+  # Initialize
+  beta <- rep(0, p)
+  tau <- 1
+  
+  # Storage
+  beta_samples <- matrix(0, n_iter, p)
+  tau_samples <- numeric(n_iter)
+  
+  for (iter in 1:n_iter) {
+    # Sample beta
+    V_beta <- solve(t(X) %*% X / tau + diag(lambda, p))
+    M_beta <- V_beta %*% t(X) %*% y / tau
+    beta <- mvrnorm(1, M_beta, V_beta)
+    
+    # Sample tau
+    alpha_n <- alpha + n / 2
+    lambda_n <- lambda + sum((y - X %*% beta)^2) / 2
+    tau <- rgamma(1, alpha_n, lambda_n)
+    
+    # Store samples
+    beta_samples[iter, ] <- beta
+    tau_samples[iter] <- tau
+  }
+  
+  list(beta_samples = beta_samples[(burn_in + 1):n_iter, ],
+       tau_samples = tau_samples[(burn_in + 1):n_iter])
+}
+
+# Run Bayesian Ridge
+ridge_results <- bayesian_ridge(X, y)
+
+brr_summary <- data.frame(
+  Mean = apply(ridge_results$beta_samples, 2, mean),
+  Median = apply(ridge_results$beta_samples, 2, median),
+  Lower = apply(ridge_results$beta_samples, 2, quantile, probs = 0.025),
+  Upper = apply(ridge_results$beta_samples, 2, quantile, probs = 0.975)
+)
+brr_summary$Significant <- with(brr_summary, sign(Lower) == sign(Upper))
+rownames(brr_summary) <- colnames(X)
+print(brr_summary)
+
+summary(lm(y ~ X[, brr_summary$Significant == TRUE]-1))
+
+```
+
+# Bayesian Lasso evaluates model based on absolute value of coefficents. it excludes variables that may be uninfluential. summary lists values of coefficients of variables that are deemed significant
+
+```{r}
+set.seed(3)
+bayesian_lasso <- function(X, y, n_iter = 10000, burn_in = 1000) {
+  n <- nrow(X)
+  p <- ncol(X)
+  
+  # Priors
+  tau2 <- 1
+  
+  # Initialize
+  beta <- rep(0, p)
+  lambda2 <- 1
+
+  
+  # Storage
+  beta_samples <- matrix(0, n_iter, p)
+  lambda2_samples <- numeric(n_iter)
+  
+  for (iter in 1:n_iter) {
+    # Sample beta
+    V_beta <- solve(t(X) %*% X + diag(1 / lambda2, p))
+    M_beta <- V_beta %*% t(X) %*% y
+    beta <- mvrnorm(1, M_beta, V_beta)
+    
+    # Sample lambda2
+    lambda2 <- rgamma(1, shape = 1, rate = abs(beta))
+    
+    # Store samples
+    beta_samples[iter, ] <- beta
+    lambda2_samples[iter] <- lambda2
+  }
+  
+  list(beta_samples = beta_samples[(burn_in + 1):n_iter, ],
+       lambda2_samples = lambda2_samples[(burn_in + 1):n_iter])
+}
+
+# Run Bayesian Lasso
+lasso_results <- bayesian_lasso(X, y)
+
+lasso_summary <- data.frame(
+  Mean = apply(lasso_results$beta_samples, 2, mean),
+  Median = apply(lasso_results$beta_samples, 2, median),
+  Lower = apply(lasso_results$beta_samples, 2, quantile, probs = 0.025),
+  Upper = apply(lasso_results$beta_samples, 2, quantile, probs = 0.975)
+)
+lasso_summary$Significant <- with(lasso_summary, sign(Lower) == sign(Upper))
+rownames(lasso_summary) <- colnames(X)
+print(lasso_summary)
+
+summary(lm(y ~ X[, lasso_summary$Significant == TRUE]-1))
+```
+
+# Bayesian SSVS compares the uncertainty of the models and how close predicted values are to the actual values of the response variable. 
+
+```{r}
+set.seed(3)
+ssvs_continuous <- function(data, y, x, inprob, runs, burn, a1, b1, prec.beta, progress) {
+  y <- data[[y]]
+  x <- data[ , colnames(data) %in% x]
+  
+  # error message for missing values
+  if (sum(is.na(x)) + sum(is.na(y)) > 0) {
+    stop("Missing values in selection")
+  }
+  
+  # Added scaling inside function for X only
+  x <- scale(as.matrix(x))
+  
+  p <- ncol(x)
+  n <- length(y)
+  
+  # initial values:
+  int <- mean(y)
+  beta <- rep(0, p)
+  alpha <- rep(0, p)
+  delta <- rep(0, p)
+  taue <- 1 / var(y)
+  
+  # keep track of stuff:
+  keep.beta <- matrix(0, runs - burn, p)
+  colnames(keep.beta) <- colnames(x)
+  keep.int <- numeric(runs - burn)
+  keep.taue <- numeric(runs - burn)
+  
+  # LET'S ROLL:
+  for (i in 1:runs) {
+    taue <- rgamma(1, n / 2 + a1, sum((y - int - x %*% beta)^2) / 2 + b1)
+    int <- rnorm(1, mean(y - x %*% beta), 1 / sqrt(n * taue))
+    
+    # update alpha
+    z <- x %*% diag(delta)
+    V <- solve(taue * t(z) %*% z + prec.beta * diag(p))
+    M <- taue * t(z) %*% (y - int)
+    alpha <- V %*% M + t(chol(V)) %*% rnorm(p)
+    beta <- alpha * delta
+    
+    # update inclusion indicators:
+    r <- y - int - x %*% beta
+    for (j in 1:p) {
+      r <- r + x[, j] * beta[j]
+      log.p.in <- log(inprob) - 0.5 * taue * sum((r - x[, j] * alpha[j])^2)
+      log.p.out <- log(1 - inprob) - 0.5 * taue * sum(r^2)
+      diff <- log.p.in - log.p.out
+      diff <- ifelse(diff > 10, 10, diff)
+      p.in <- exp(diff) / (1 + exp(diff))
+      delta[j] <- rbinom(1, 1, p.in)
+      beta[j] <- delta[j] * alpha[j]
+      r <- r - x[, j] * beta[j]
+    }
+    
+    # Store the output:
+    if (i > burn) {
+      keep.beta[i - burn, ] <- beta
+      keep.int[i - burn] <- int
+      keep.taue[i - burn] <- taue
+    }
+    
+    if ((i %% 1000 == 0) & (progress == TRUE)) {
+      plot(beta, main = paste("Iteration", i))
+      abline(0, 0)
+    }
+  }
+  
+  result <- list(
+    beta = keep.beta,
+    int = keep.int,
+    taue = keep.taue
+  )
+  
+  result
+}
+
+# Example usage for benchmark data
+ssvs_results <- ssvs_continuous(data = data, y = "y", x = colnames(X), inprob = 0.5, runs = 10000, burn = 1000, a1 = 0.1, b1 = 0.1, prec.beta = 1, progress = TRUE)
+summary(ssvs_results$beta)
+colnames(ssvs_results$beta)
+dim(ssvs_results$beta)
+```
+
+# Model Comparison
+
+```{r}
+set.seed(3)
+# Define the calculate_dic() function
+calculate_dic <- function(log_posterior_linear, pD_linear) {
+  # Calculate the deviance
+  deviance <- -2 * log_posterior_linear
+  
+  # Calculate the DIC
+  dic <- deviance + 2 * pD_linear
+  
+  return(dic)
+}
+
+# Define the calculate_waic_manual function
+calculate_waic_manual <- function(log_likelihoods) {
+  # Calculate the log pointwise predictive density
+  lppd <- sum(log(colMeans(exp(log_likelihoods))))
+  
+  # Calculate the pointwise variance of the log likelihood
+  p_waic <- sum(apply(log_likelihoods, 2, var))
+  
+  # Calculate the WAIC
+  waic <- -2 * (lppd - p_waic)
+  
+  return(list(waic = waic, lppd = lppd, p_waic = p_waic))
+}
+
+# Function to calculate log posterior for each data point
+calculate_log_posterior_samples <- function(beta_samples, X, y, tau_samples, prior_sd = 1) {
+  n_samples <- nrow(beta_samples)
+  log_posteriors <- numeric(n_samples)
+  X_subset <- X[, colnames(beta_samples)]
+  
+  for (i in 1:n_samples) {
+    y_pred <- X_subset %*% beta_samples[i, ]
+    log_likelihood <- sum(dnorm
+
+(y, mean = y_pred, sd = sqrt(1 / tau_samples[i]), log = TRUE))
+    log_prior <- sum(dnorm(beta_samples[i, ], mean = 0, sd = prior_sd, log = TRUE))
+    log_posteriors[i] <- log_likelihood + log_prior
+  }
+  
+  return(log_posteriors)
+}
+
+# Calculate log-posterior for Bayesian Ridge
+log_posterior_ridge <- calculate_log_posterior_samples(ridge_results$beta_samples, X, y, ridge_results$tau_samples)
+# Ensure log-posterior values are finite
+log_posterior_ridge <- log_posterior_ridge[is.finite(log_posterior_ridge)]
+
+# Calculate DIC for Bayesian Ridge
+pD_ridge <- ncol(X)
+dic_ridge <- calculate_dic(mean(log_posterior_ridge), pD_ridge)
+
+# Calculate WAIC for Bayesian Ridge
+waic_ridge <- calculate_waic_manual(matrix(log_posterior_ridge, ncol = 1))
+
+# Output DIC and WAIC for Bayesian Ridge
+cat("Bayesian Ridge DIC (Boston):", dic_ridge, "\n")
+cat("Bayesian Ridge WAIC (Boston):", waic_ridge$waic, "\n")
+
+# Calculate log-posterior for Bayesian Lasso
+log_posterior_lasso <- calculate_log_posterior_samples(lasso_results$beta_samples, X, y, lasso_results$lambda2_samples)
+# Ensure log-posterior values are finite
+log_posterior_lasso <- log_posterior_lasso[is.finite(log_posterior_lasso)]
+
+# Calculate DIC for Bayesian Lasso
+pD_lasso <- ncol(X)
+dic_lasso <- calculate_dic(mean(log_posterior_lasso), pD_lasso)
+
+# Calculate WAIC for Bayesian Lasso
+waic_lasso <- calculate_waic_manual(matrix(log_posterior_lasso, ncol = 1))
+
+# Output DIC and WAIC for Bayesian Lasso
+cat("Bayesian Lasso DIC (Boston):", dic_lasso, "\n")
+cat("Bayesian Lasso WAIC (Boston):", waic_lasso$waic, "\n")
+```
+
+# Bayesian SSVS Model Comparison
+
+```{r}
+set.seed(3)
+# Function to calculate log posterior for SSVS model
+calculate_log_posterior_ssvs <- function(beta_samples, X, y, tau_samples, prior_sd = 1) {
+  n_samples <- nrow(beta_samples)
+  log_posteriors <- numeric(n_samples)
+  X_subset <- X[, colnames(beta_samples)]
+  
+  for (i in 1:n_samples) {
+    y_pred <- X_subset %*% beta_samples[i, ]
+    log_likelihood <- sum(dnorm(y, mean = y_pred, sd = sqrt(1 / tau_samples[i]), log = TRUE))
+    log_prior <- sum(dnorm(beta_samples[i, ], mean = 0, sd = prior_sd, log = TRUE))
+    log_posteriors[i] <- log_likelihood + log_prior
+  }
+  
+  return(log_posteriors)
+}
+
+# Ensure dimensions match between X and beta_samples
+X <- as.matrix(X)
+
+# Calculate log posterior for SSVS model
+log_posterior_ssvs <- calculate_log_posterior_ssvs(ssvs_results$beta, X, y, ssvs_results$taue)
+
+# Ensure log-posterior values are finite
+log_posterior_ssvs <- log_posterior_ssvs[is.finite(log_posterior_ssvs)]
+
+# Calculate DIC for SSVS model
+pD_ssvs <- ncol(X)
+dic_ssvs <- calculate_dic(mean(log_posterior_ssvs), pD_ssvs)
+
+# Calculate WAIC for SSVS model
+waic_ssvs <- calculate_waic_manual(matrix(log_posterior_ssvs, ncol = 1))
+
+# Output DIC and WAIC for SSVS model
+cat("SSVS Model DIC (Boston):", dic_ssvs, "\n")
+cat("SSVS Model WAIC (Boston):", waic_ssvs$waic, "\n")
+```
+
+# Bayes Factor Calculation
+
+```{r}
+set.seed(3)
+# Function to calculate Bayes Factor
+calculate_bayes_factor <- function(log_posterior1, log_posterior2) {
+  bf <- exp(sum(log_posterior1) - sum(log_posterior2))
+  return(bf)
+}
+
+# Calculate Bayes Factor between SSVS model and linear model
+bf_ssvs_lasso <- calculate_bayes_factor(log_posterior_ssvs, log_posterior_lasso)
+
+# Output Bayes Factor for SSVS vs Linear model
+cat("Bayes Factor (SSVS vs Lasso, Boston):", bf_ssvs_lasso, "\n")
+```
+
+# 5-Fold Cross-Validation
+
+```{r}
+set.seed(3)
+library(elasticnet)
+# Perform 5-fold cross-validation
+cv_ridge <- train(y ~ ., data = data, method = "ridge", trControl = trainControl(method = "cv", number = 5))
+cv_lasso <- train(y ~ ., data = data, method = "lasso", trControl = trainControl(method = "cv", number = 5))
+cv_ssvs <- train(y ~ ., data = data, method = "lm", trControl = trainControl(method = "cv", number = 5))
+
+# Output cross-validation results
+cat("5-Fold Cross-Validation RMSE for Bayesian Ridge:", mean(cv_ridge$results$RMSE), "\n")
+cat("5-Fold Cross-Validation RMSE for Bayesian Lasso:", mean(cv_lasso$results$RMSE), "\n")
+cat("5-Fold Cross-Validation RMSE for Bayesian SSVS:", mean(cv_ssvs$results$RMSE), "\n")
+```
+
+
+
+```{R}
+set.seed(3)
+# Summarize the marginal distributions of the beta_j
+beta <- ssvs_results$beta
+names <- colnames(ssvs_results$beta)
+
+for (j in 1:ncol(beta)) {
+  hist(beta[, j], xlab = expression(beta[j]), ylab = "Posterior density",
+       breaks = 100, main = names[j])
+}
+
+# Inclusion probabilities and credible intervals
+Inc_Prob <- apply(beta != 0, 2, mean)
+Q <- t(apply(beta, 2, quantile, c(0.5, 0.05, 0.95)))
+out <- cbind(Inc_Prob, Q)
+colnames(out) <- c("Inc_Prob", "50%", "5%", "95%")
+knitr::kable(round(out, 2))
+
+#Posterior Probability of Each Model
+model <- "Intercept" 
+for(j in 1:ncol(beta)){
+  model <- paste(model, ifelse(beta[, j] == 0, "", "+"), ifelse(beta[, j] == 0, "", names[j]))
+}
+
+model_probs <- table(model) / length(model)
+model_probs <- sort(model_probs, decreasing = TRUE)
+round(model_probs, 3)
+
+# Trace plot for beta samples
+par(mfrow = c(2, 3))
+for (j in 1:ncol(ssvs_results$beta)) {
+  plot(ssvs_results$beta[, j], type = 'l', main = paste("Trace plot of", names[j]), ylab = paste("beta", j), xlab = "Iteration")
+}
+
+```
+
+## Conclusion
+
+This document provided an integrated approach to Bayesian analysis and variable selection using the `Boston` dataset. The analyses included Bayesian Ridge, Bayesian Lasso, and Bayesian SSVS methods. The models were compared using DIC, WAIC, Bayes Factor, and 5-fold cross-validation, demonstrating the effectiveness of the Bayesian approaches.
