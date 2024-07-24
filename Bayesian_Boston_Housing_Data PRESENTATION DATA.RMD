@@ -36,57 +36,86 @@ data <- data.frame(y = y, X)
 
 ```{r}
 set.seed(3)
-bayesian_ridge <- function(X, y, n_iter = 10000, burn_in = 1000) {
+bayesian_ridge_horseshoe <- function(X, y, n_iter = 10000, burn_in = 1000) {
   n <- nrow(X)
   p <- ncol(X)
   
+  #hyperparameters
+  nu<- 5
+  lambda_0<-1e-1
+  gamma<- rep(5,p)
+  
   # Priors
-  alpha <- 1e-6
-  lambda <- 1e-6
+  alpha <- 10
+  
   
   # Initialize
   beta <- rep(0, p)
-  tau <- 1
+  tau_sq <- 1
+  lambda <-rep(1,p)
   
   # Storage
   beta_samples <- matrix(0, n_iter, p)
-  tau_samples <- numeric(n_iter)
+  tau_sq_samples <- numeric(n_iter)
+  lambda_samples<- matrix(0,n_iter,p)
+  gamma_samples<- matrix(0,n_iter,p)
   
   for (iter in 1:n_iter) {
     # Sample beta
-    V_beta <- solve(t(X) %*% X / tau + diag(lambda, p))
-    M_beta <- V_beta %*% t(X) %*% y / tau
+    V_beta <- solve(t(X) %*% X / tau_sq + diag(lambda^2, p))
+    M_beta <- V_beta %*% t(X) %*% y / tau_sq
     beta <- mvrnorm(1, M_beta, V_beta)
     
-    # Sample tau
-    alpha_n <- alpha + n / 2
-    lambda_n <- lambda + sum((y - X %*% beta)^2) / 2
-    tau <- rgamma(1, alpha_n, lambda_n)
+    # Sample tau_sq
+    alpha_n <- alpha + p/2
+    beta_n <- lambda_0+sum((y - X %*% beta)^2) / 2
+    tau_sq <- 1/rgamma(1, alpha_n, beta_n)
+    
+    #sample lambda using global scale parameters
+    lambda<- sqrt(rgamma(p,nu/2,nu/(2*gamma^2)))
+    
+    for(j in 1:p){
+      gamma[j]<-sqrt(rgamma(1, nu/2,nu/(2*lambda[j]^2)))
+    }
     
     # Store samples
     beta_samples[iter, ] <- beta
-    tau_samples[iter] <- tau
+    tau_sq_samples[iter] <- tau_sq
+    lambda_samples[iter, ]<- lambda
+    gamma_samples[iter, ]<- gamma
   }
   
   list(beta_samples = beta_samples[(burn_in + 1):n_iter, ],
-       tau_samples = tau_samples[(burn_in + 1):n_iter])
+       tau_sq_samples = tau_sq_samples[(burn_in + 1):n_iter],
+       lambda_samples = lambda_samples[(burn_in+1):n_iter, ],
+       gamma_samples = gamma_samples[(burn_in+1):n_iter, ])
 }
 
 # Run Bayesian Ridge
-ridge_results <- bayesian_ridge(X, y)
+horseshoe_results <- bayesian_ridge_horseshoe(X, y)
 
-brr_summary <- data.frame(
-  Mean = apply(ridge_results$beta_samples, 2, mean),
-  Median = apply(ridge_results$beta_samples, 2, median),
-  Lower = apply(ridge_results$beta_samples, 2, quantile, probs = 0.025),
-  Upper = apply(ridge_results$beta_samples, 2, quantile, probs = 0.975)
+horseshoe_summary <- data.frame(
+  Mean = apply(horseshoe_results$beta_samples, 2, mean),
+  Median = apply(horseshoe_results$beta_samples, 2, median),
+  Lower = apply(horseshoe_results$beta_samples, 2, quantile, probs = 0.025),
+  Upper = apply(horseshoe_results$beta_samples, 2, quantile, probs = 0.975)
 )
-brr_summary$Significant <- with(brr_summary, sign(Lower) == sign(Upper))
-rownames(brr_summary) <- colnames(X)
-print(brr_summary)
 
-summary(lm(y ~ X[, brr_summary$Significant == TRUE]-1))
+horseshoe_summary$Significant <- with(horseshoe_summary, sign(Lower) == sign(Upper))
+rownames(horseshoe_summary) <- colnames(X)
+print(horseshoe_summary)
 
+significant_vars <- rownames(horseshoe_summary)[horseshoe_summary$Significant]
+if(length(significant_vars)==0){
+  cat("None Significant.")
+}
+
+#linear model summary
+formula <- as.formula(paste("y ~", paste(significant_vars, collapse = " + ")))
+lm_fit <- lm(formula, data = data.frame(y = y, X))
+summary(lm_fit)
+
+```
 ```
 
 # Bayesian Lasso evaluates model based on absolute value of coefficents. it excludes variables that may be uninfluential. summary lists values of coefficients of variables that are deemed significant
